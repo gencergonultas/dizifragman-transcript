@@ -2,16 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 YouTube Transcript Flask API
-Fragman-duzenle.php ile entegre çalışır
-
-Kurulum:
-    pip install flask flask-cors youtube-transcript-api
-
-Çalıştırma:
-    python flask_transcript_api.py
-    
-Test:
-    curl "http://localhost:5000/api/get-transcript?v=VIDEO_ID"
+Render.com ve Docker için optimize edilmiş 7/24 kesintisiz çalışan API servisi.
 """
 
 import os
@@ -22,36 +13,28 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Tüm origin'lere izin ver (CORS)
+CORS(app)
 
-# youtube-transcript-api yüklü mü kontrol et
+TRANSCRIPT_API_AVAILABLE = False
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import (
-        TranscriptsDisabled,
-        NoTranscriptFound,
-        CouldNotRetrieveTranscript,
-    )
     TRANSCRIPT_API_AVAILABLE = True
 except Exception as e:
-    TRANSCRIPT_API_AVAILABLE = False
-    print(f"⚠️  youtube-transcript-api import hatası: {e}")
+    print(f"⚠️ youtube-transcript-api import hatası: {e}")
 
 
 def extract_video_id(url_or_id):
-    """YouTube URL'den veya direkt ID'den video ID çıkar"""
     if not url_or_id:
         return None
-    
-    # Zaten sadece ID ise (11 karakter)
+    url_or_id = str(url_or_id).strip()
     if re.match(r'^[a-zA-Z0-9_-]{11}$', url_or_id):
         return url_or_id
-    
+
     patterns = [
-        r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})',
-        r'youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})'
+        r'(?:v=|\/)([a-zA-Z0-9_-]{11})(?:[&?].*)?$',
+        r'(?:embed\/|v\/|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})',
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, url_or_id)
         if match:
@@ -59,222 +42,145 @@ def extract_video_id(url_or_id):
     return None
 
 
-@app.route('/api/get-transcript', methods=['GET', 'POST'])
-def get_transcript():
-    """
-    YouTube video transcript'ini alır
-    
-    GET parametreleri:
-        v: Video ID
-        url: YouTube URL
-    
-    POST body (JSON):
-        video_id: Video ID
-        video_url: YouTube URL
-    """
-    
-    if not TRANSCRIPT_API_AVAILABLE:
-        return jsonify({
-            'success': False,
-            'error': 'youtube-transcript-api yüklü değil. pip install youtube-transcript-api'
-        }), 500
-    
+def normalize_text(text: str) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def format_transcript_result(fetched, video_id: str, method: str) -> dict:
+    if hasattr(fetched, 'to_raw_data'):
+        raw_data = fetched.to_raw_data()
+    elif isinstance(fetched, list):
+        raw_data = fetched
+    else:
+        raw_data = list(fetched)
+
+    transcript = []
+    for item in raw_data:
+        text = normalize_text(str(item.get("text", "")))
+        if not text:
+            continue
+        transcript.append(
+            {
+                "start": float(item.get("start", 0) or 0),
+                "duration": float(item.get("duration", 0) or 0),
+                "text": text,
+            }
+        )
+
+    full_text = " ".join([entry["text"] for entry in transcript]).strip()
+    lang = getattr(fetched, "language_code", "") if not isinstance(fetched, list) else "auto"
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        "full_text": full_text,
+        "text": full_text,
+        "transcript": transcript,
+        "count": len(transcript),
+        "language": lang,
+        "lang": lang,
+        "word_count": len(full_text.split()),
+        "char_count": len(full_text),
+        "method": method,
+    }
+
+
+def fetch_transcript_core(video_id: str) -> dict:
+    # 1. v1.x instance API'yi dene
     try:
-        # GET veya POST'dan parametreleri al
-        if request.method == 'GET':
-            video_id = request.args.get('v') or extract_video_id(request.args.get('url', ''))
-        else:
-            data = request.get_json() or {}
-            video_id = data.get('video_id') or extract_video_id(data.get('video_url', ''))
-        
-        if not video_id:
-            return jsonify({
-                'success': False,
-                'error': 'video_id veya video_url gerekli'
-            }), 400
-        
-        transcript = None
-        language = None
-        
-        # Mevcut transkriptleri listele
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            
-            # 1. Türkçe manuel altyazı var mı?
+        api = YouTubeTranscriptApi()
+        # Direct fetch: once tr, sonra tr+en
+        for m_name, langs in [("tr", ["tr", "tr-TR"]), ("tr-en", ["tr", "tr-TR", "en", "en-US"])]:
             try:
-                tr_transcript = transcript_list.find_transcript(['tr'])
-                transcript = tr_transcript.fetch()
-                language = 'tr'
-            except NoTranscriptFound:
+                res = api.fetch(video_id, languages=langs)
+                return format_transcript_result(res, video_id, f"v1-fetch-{m_name}")
+            except Exception:
                 pass
-            
-            # 2. Türkçe yoksa, otomatik oluşturulan Türkçe var mı?
-            if not transcript:
+
+        # api.list() dene
+        try:
+            t_list = api.list(video_id)
+            for m_name, fn in [
+                ("find-tr", lambda: t_list.find_transcript(["tr", "tr-TR"]).fetch()),
+                ("gen-tr", lambda: t_list.find_generated_transcript(["tr", "tr-TR"]).fetch()),
+                ("find-en", lambda: t_list.find_transcript(["en", "en-US"]).fetch()),
+            ]:
                 try:
-                    for t in transcript_list:
-                        if t.is_generated and t.language_code in ['tr', 'tr-TR']:
-                            transcript = t.fetch()
-                            language = 'tr-auto'
-                            break
+                    res = fn()
+                    return format_transcript_result(res, video_id, f"v1-list-{m_name}")
                 except Exception:
                     pass
-            
-            # 3. Hala yoksa, herhangi bir dili Türkçeye çevir
-            if not transcript:
+
+            # Son care ilk eleman
+            first = next(iter(t_list))
+            return format_transcript_result(first.fetch(), video_id, "v1-first")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # 2. v0.6.x static API fallback
+    try:
+        if hasattr(YouTubeTranscriptApi, 'get_transcript'):
+            for langs in [["tr", "tr-TR"], ["tr", "tr-TR", "en", "en-US"], None]:
                 try:
-                    generated = transcript_list.find_generated_transcript(['en', 'tr'])
-                    transcript = generated.translate('tr').fetch()
-                    language = 'tr-translated'
+                    kwargs = {"languages": langs} if langs else {}
+                    raw = YouTubeTranscriptApi.get_transcript(video_id, **kwargs)
+                    if raw:
+                        return format_transcript_result(raw, video_id, "v0-get_transcript")
                 except Exception:
-                    try:
-                        manual = transcript_list.find_manually_created_transcript(['en', 'tr'])
-                        transcript = manual.fetch()
-                        language = manual.language_code
-                    except Exception:
-                        pass
-            
-            # 4. Son çare: ne varsa al
-            if not transcript:
-                for t in transcript_list:
-                    transcript = t.fetch()
-                    language = t.language_code
-                    break
-                    
-        except TranscriptsDisabled:
+                    pass
+    except Exception:
+        pass
+
+    return {
+        "success": False,
+        "error": "Bu video için altyazı veya transkript bulunamadı.",
+        "video_id": video_id,
+    }
+
+
+@app.route('/api/get-transcript', methods=['GET', 'POST'])
+@app.route('/transcript', methods=['GET', 'POST'])
+@app.route('/', methods=['GET'])
+def get_transcript():
+    video_param = request.args.get('v') or request.args.get('video_id') or request.args.get('url')
+    if request.method == 'POST' and not video_param:
+        data = request.get_json(silent=True) or {}
+        video_param = data.get('video_id') or data.get('v') or data.get('video_url') or data.get('url')
+
+    if not video_param:
+        # Ana sayfa bilgisi
+        if request.path == '/':
             return jsonify({
-                'success': False,
-                'error': 'Bu videoda altyazılar devre dışı',
-                'video_id': video_id
-            }), 404
-            
-        except (NoTranscriptFound, CouldNotRetrieveTranscript):
-            return jsonify({
-                'success': False,
-                'error': 'Bu video için hiç altyazı yok',
-                'video_id': video_id
-            }), 404
-        
-        if not transcript:
-            return jsonify({
-                'success': False,
-                'error': 'Altyazı bulunamadı',
-                'video_id': video_id
-            }), 404
-        
-        # Metni birleştir
-        full_text = ' '.join([
-            entry['text'].replace('\n', ' ') 
-            for entry in transcript
-        ])
-        
-        # Temizle (gereksiz boşlukları kaldır)
-        full_text = re.sub(r'\s+', ' ', full_text).strip()
-        
-        return jsonify({
-            'success': True,
-            'video_id': video_id,
-            'language': language,
-            'full_text': full_text,
-            'word_count': len(full_text.split()),
-            'char_count': len(full_text)
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'type': type(e).__name__,
-            'trace': traceback.format_exc()
-        }), 500
+                "service": "DiziFragman YouTube Transcript API",
+                "status": "online",
+                "usage": "/api/get-transcript?v=VIDEO_ID",
+                "health": "/health"
+            })
+        return jsonify({"success": False, "error": "video_id veya v parametresi gerekli"}), 400
+
+    video_id = extract_video_id(video_param)
+    if not video_id:
+        return jsonify({"success": False, "error": "Geçersiz video ID"}), 400
+
+    result = fetch_transcript_core(video_id)
+    status_code = 200 if result.get("success") else 404
+    return jsonify(result), status_code
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    """API sağlık kontrolü"""
     return jsonify({
-        'status': 'healthy',
-        'service': 'YouTube Transcript API',
-        'transcript_api_available': TRANSCRIPT_API_AVAILABLE
+        "status": "healthy",
+        "service": "YouTube Transcript API",
+        "transcript_api_available": TRANSCRIPT_API_AVAILABLE,
     })
 
 
-@app.route('/transcript/<video_id>', methods=['GET'])
-def get_transcript_simple(video_id):
-    """Basit endpoint: /transcript/VIDEO_ID"""
-    # GET parametresi olarak ayarla
-    from werkzeug.datastructures import ImmutableMultiDict
-    request.args = ImmutableMultiDict([('v', video_id)])
-    return get_transcript()
-
-
-@app.route('/', methods=['GET'])
-def index():
-    """Ana sayfa - API dokümantasyonu"""
-    return '''
-    <html>
-    <head>
-        <title>YouTube Transcript API</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-            code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
-            pre { background: #f4f4f4; padding: 15px; border-radius: 8px; overflow-x: auto; }
-            h1 { color: #cc0000; }
-            .endpoint { background: #e8f5e9; padding: 10px; border-radius: 8px; margin: 10px 0; }
-        </style>
-    </head>
-    <body>
-        <h1>🎬 YouTube Transcript API</h1>
-        <p>YouTube videolarından altyazı/transkript çekmek için basit API.</p>
-        
-        <h2>Endpoint'ler</h2>
-        
-        <div class="endpoint">
-            <strong>GET</strong> <code>/api/get-transcript?v=VIDEO_ID</code>
-            <p>Video ID ile transkript al</p>
-        </div>
-        
-        <div class="endpoint">
-            <strong>GET</strong> <code>/transcript/VIDEO_ID</code>
-            <p>Kısa URL ile transkript al</p>
-        </div>
-        
-        <div class="endpoint">
-            <strong>GET</strong> <code>/health</code>
-            <p>API sağlık kontrolü</p>
-        </div>
-        
-        <h2>Örnek İstek</h2>
-        <pre>curl "http://localhost:5000/api/get-transcript?v=dQw4w9WgXcQ"</pre>
-        
-        <h2>Örnek Yanıt</h2>
-        <pre>{
-  "success": true,
-  "video_id": "dQw4w9WgXcQ",
-  "language": "tr",
-  "full_text": "Merhaba dünya...",
-  "word_count": 150,
-  "char_count": 850
-}</pre>
-
-        <p><a href="/health">API Durumu</a></p>
-    </body>
-    </html>
-    '''
-
-
 if __name__ == '__main__':
-    print("=" * 50)
-    print("🎬 YouTube Transcript API Başlatılıyor...")
-    print("=" * 50)
-    print(f"📦 youtube-transcript-api: {'✅ Yüklü' if TRANSCRIPT_API_AVAILABLE else '❌ Yüklü değil'}")
-    print()
-    print("🌐 Adres: http://localhost:5000")
-    print("📖 Dokümantasyon: http://localhost:5000/")
-    print("❤️  Sağlık: http://localhost:5000/health")
-    print()
-    print("Örnek kullanım:")
-    print('  curl "http://localhost:5000/api/get-transcript?v=VIDEO_ID"')
-    print("=" * 50)
-    
     port = int(os.environ.get('PORT', 5000))
+    print(f"🎬 DiziFragman Transcript API {port} portunda başlatılıyor...")
     app.run(host='0.0.0.0', port=port)
