@@ -14,10 +14,12 @@ Test:
     curl "http://localhost:5000/api/get-transcript?v=VIDEO_ID"
 """
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import os
+import sys
 import re
 import traceback
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)  # Tüm origin'lere izin ver (CORS)
@@ -25,12 +27,15 @@ CORS(app)  # Tüm origin'lere izin ver (CORS)
 # youtube-transcript-api yüklü mü kontrol et
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, NoTranscriptAvailable
+    from youtube_transcript_api._errors import (
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        CouldNotRetrieveTranscript,
+    )
     TRANSCRIPT_API_AVAILABLE = True
-except ImportError:
+except Exception as e:
     TRANSCRIPT_API_AVAILABLE = False
-    print("⚠️  youtube-transcript-api yüklü değil!")
-    print("   Yüklemek için: pip install youtube-transcript-api")
+    print(f"⚠️  youtube-transcript-api import hatası: {e}")
 
 
 def extract_video_id(url_or_id):
@@ -142,7 +147,7 @@ def get_transcript():
                 'video_id': video_id
             }), 404
             
-        except NoTranscriptAvailable:
+        except (NoTranscriptFound, CouldNotRetrieveTranscript):
             return jsonify({
                 'success': False,
                 'error': 'Bu video için hiç altyazı yok',
